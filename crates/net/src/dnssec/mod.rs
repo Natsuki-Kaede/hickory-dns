@@ -1148,6 +1148,23 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         }
     }
 
+    /// Validate `result`, a response for `query` that the caller obtained from the wrapped handle
+    /// itself instead of through [`DnsHandle::send`].
+    ///
+    /// This lets a caller send the original query with per-request parameters (for example an
+    /// EDNS Client Subnet option) while the queries made for validation (DNSKEY, DS, NS) are sent
+    /// through this handle with `options` only.
+    pub async fn verify(
+        &self,
+        query: Query,
+        options: DnsRequestOptions,
+        result: Result<DnsResponse, NetError>,
+    ) -> Result<DnsResponse, NetError> {
+        self.clone_with_context()
+            .verify_response(result, query, options)
+            .await
+    }
+
     /// Get a reference to the underlying handle.
     pub fn inner(&self) -> &H {
         &self.handle

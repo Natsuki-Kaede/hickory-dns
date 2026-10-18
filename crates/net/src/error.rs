@@ -23,6 +23,7 @@ use crate::proto::ProtoError;
 use crate::proto::dnssec::Proof;
 use crate::proto::op::{DnsResponse, Query, ResponseCode};
 use crate::proto::rr::RData;
+use crate::proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use crate::proto::rr::{DNSClass, Name, Record, RecordRef, RecordType, rdata::SOA};
 use crate::proto::serialize::binary::DecodeError;
 
@@ -462,6 +463,13 @@ impl DnsError {
                     };
 
                     let negative_ttl = response.negative_ttl();
+                    let client_subnet = response
+                        .edns
+                        .as_ref()
+                        .and_then(|edns| match edns.option(EdnsCode::Subnet) {
+                            Some(EdnsOption::Subnet(subnet)) => Some(*subnet),
+                            _ => None,
+                        });
                     let query = response.into_message().queries.drain(..).next().unwrap_or_default();
 
                     Err(Self::NoRecordsFound(NoRecords {
@@ -471,6 +479,7 @@ impl DnsError {
                         negative_ttl,
                         response_code: code,
                         authorities,
+                        client_subnet,
                     }))
                 }
                 NXDomain
@@ -531,6 +540,11 @@ pub struct NoRecords {
     pub response_code: ResponseCode,
     /// Authority records from the query. These are important to preserve for DNSSEC validation.
     pub authorities: Option<Arc<[Record]>>,
+    /// The EDNS Client Subnet option of the response, if present
+    /// ([RFC 7871](https://www.rfc-editor.org/rfc/rfc7871)).
+    ///
+    /// A negative answer may be scoped to a client subnet like any other answer.
+    pub client_subnet: Option<ClientSubnet>,
 }
 
 impl NoRecords {
@@ -543,6 +557,7 @@ impl NoRecords {
             negative_ttl: None,
             response_code,
             authorities: None,
+            client_subnet: None,
         }
     }
 }
