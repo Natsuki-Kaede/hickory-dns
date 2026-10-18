@@ -673,7 +673,7 @@ async fn get_zone_name(
     match recursor.mode {
         RecursorMode::NonValidating { ref handle } => {
             let ns_pool = handle
-                .ns_pool_for_name(query.clone(), Instant::now(), 0, &RequestLimits::new())
+                .ns_pool_for_name(query.clone(), Instant::now(), 0, &RequestLimits::new(200))
                 .await?
                 .1;
             Ok(ns_pool.zone().cloned())
@@ -833,6 +833,41 @@ async fn server_attempt_timeout_configures_name_server_pools() {
         ..options
     };
     assert!(Recursor::with_options(&[ROOT_IP], options, provider).is_err());
+}
+
+#[tokio::test]
+async fn max_queries_per_request_limits_upstream_queries() {
+    let (provider, options) = test_fixture().unwrap();
+    let query = Query::query(
+        Name::from_ascii("host.hickory-dns.testing.").unwrap(),
+        RecordType::A,
+    );
+
+    let recursor = Recursor::with_options(&[ROOT_IP], options.clone(), provider.clone()).unwrap();
+    assert!(
+        recursor
+            .resolve(query.clone(), Instant::now(), false)
+            .await
+            .is_ok()
+    );
+
+    // The answer needs a referral from the root and the TLD before the leaf query.
+    let limited = RecursorOptions {
+        max_queries_per_request: 2,
+        ..options.clone()
+    };
+    let recursor = Recursor::with_options(&[ROOT_IP], limited, provider.clone()).unwrap();
+    let result = recursor.resolve(query, Instant::now(), false).await;
+    assert!(
+        matches!(result, Err(RecursorError::QueryBudgetExceeded)),
+        "{result:?}"
+    );
+
+    let zero = RecursorOptions {
+        max_queries_per_request: 0,
+        ..options
+    };
+    assert!(Recursor::with_options(&[ROOT_IP], zero, provider).is_err());
 }
 
 fn test_fixture() -> Result<(MockProvider, RecursorOptions), NetError> {
@@ -1217,7 +1252,10 @@ mod ecs {
 
     use super::*;
     #[cfg(feature = "__dnssec")]
-    use crate::recursor::{DnssecConfig, DnssecPolicy};
+    use crate::{
+        proto::dnssec::Proof,
+        recursor::{DnssecConfig, DnssecPolicy},
+    };
     use crate::{
         proto::{
             op::{Edns, OpCode, ResponseCode},
@@ -1657,6 +1695,58 @@ mod ecs {
         let resolution = fixture.resolve(HOST, options).await;
         assert!(resolution.result.is_err());
         assert!(fixture.seen.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "__dnssec")]
+    #[tokio::test]
+    async fn checking_disabled_skips_validation_and_validated_cache() {
+        let fixture = Fixture::build(&[], None, true);
+        let RecursorMode::Validating(validating) = &fixture.recursor.mode else {
+            panic!("expected a validating recursor");
+        };
+        let query = Query::query(name(HOST), RecordType::A);
+        let cached = || {
+            validating
+                .validated_response_cache
+                .get(&query, Instant::now())
+        };
+        let proofs = |response: Message| {
+            response
+                .answers
+                .iter()
+                .map(|record| record.proof)
+                .collect::<Vec<_>>()
+        };
+        let checking_disabled = ResolveOptions {
+            checking_disabled: true,
+            ..ResolveOptions::default()
+        };
+
+        // The unsigned answer is not validated and not stored as validated.
+        let response = fixture
+            .resolve(HOST, checking_disabled)
+            .await
+            .result
+            .unwrap();
+        assert_eq!(proofs(response), [Proof::Indeterminate]);
+        assert!(cached().is_none());
+
+        // Validation marks it Bogus and caches it.
+        let response = fixture
+            .resolve(HOST, ResolveOptions::default())
+            .await
+            .result
+            .unwrap();
+        assert_eq!(proofs(response), [Proof::Bogus]);
+        assert!(cached().is_some());
+
+        // A request with CD does not read the validated answer.
+        let response = fixture
+            .resolve(HOST, checking_disabled)
+            .await
+            .result
+            .unwrap();
+        assert_eq!(proofs(response), [Proof::Indeterminate]);
     }
 
     #[cfg(feature = "__dnssec")]

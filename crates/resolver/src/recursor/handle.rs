@@ -3,7 +3,7 @@ use std::{
     net::IpAddr,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU16, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -61,6 +61,7 @@ pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     request_options: DnsRequestOptions,
     ttl_config: TtlConfig,
     qname_minimization: QNameMinimization,
+    max_queries_per_request: u16,
 }
 
 impl<P: ConnectionProvider> RecursorDnsHandle<P> {
@@ -95,11 +96,17 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             edns_payload_len,
             qname_minimization,
             server_attempt_timeout,
+            max_queries_per_request,
         } = options;
 
         if server_attempt_timeout.is_zero() {
             return Err(RecursorError::from(
                 "server_attempt_timeout must be nonzero",
+            ));
+        }
+        if max_queries_per_request == 0 {
+            return Err(RecursorError::from(
+                "max_queries_per_request must be nonzero",
             ));
         }
 
@@ -169,7 +176,16 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             request_options,
             ttl_config: cache_policy.clone(),
             qname_minimization,
+            max_queries_per_request,
         })
+    }
+
+    /// Per-request state for a client request with `options`.
+    pub(crate) fn request_limits(
+        &self,
+        options: ResolveOptions,
+    ) -> Result<RequestLimits, RecursorError> {
+        RequestLimits::with_options(options, self.max_queries_per_request)
     }
 
     pub(crate) async fn resolve(
@@ -1009,7 +1025,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
 /// Per-request state: query budgets, the caller's [`ResolveOptions`] and the ECS scope seen.
 pub(crate) struct RequestLimits {
-    req_query_count: AtomicU8,
+    req_query_count: AtomicU16,
+    max_queries: u16,
     cname_limit: AtomicU8,
     in_flight_zones: Mutex<HashSet<Name>>,
     options: ResolveOptions,
@@ -1018,9 +1035,11 @@ pub(crate) struct RequestLimits {
 }
 
 impl RequestLimits {
-    pub(crate) fn new() -> Self {
+    /// Per-request state allowing `max_queries` upstream queries.
+    pub(crate) fn new(max_queries: u16) -> Self {
         Self {
-            req_query_count: AtomicU8::new(0),
+            req_query_count: AtomicU16::new(0),
+            max_queries,
             cname_limit: AtomicU8::new(0),
             in_flight_zones: Mutex::new(HashSet::new()),
             options: ResolveOptions::default(),
@@ -1029,7 +1048,10 @@ impl RequestLimits {
     }
 
     /// Per-request state for `options`; the client subnet is normalized for the wire.
-    pub(crate) fn with_options(mut options: ResolveOptions) -> Result<Self, RecursorError> {
+    pub(crate) fn with_options(
+        mut options: ResolveOptions,
+        max_queries: u16,
+    ) -> Result<Self, RecursorError> {
         if let Some(subnet) = &mut options.client_subnet {
             let source_prefix = subnet.source_prefix();
             let network = IpNet::new(subnet.addr(), source_prefix)
@@ -1044,12 +1066,18 @@ impl RequestLimits {
 
         Ok(Self {
             options,
-            ..Self::new()
+            ..Self::new(max_queries)
         })
     }
 
     pub(crate) fn client_subnet(&self) -> Option<ClientSubnet> {
         self.options.client_subnet
+    }
+
+    /// Whether the client asked not to validate the answer.
+    #[cfg(feature = "__dnssec")]
+    pub(crate) fn checking_disabled(&self) -> bool {
+        self.options.checking_disabled
     }
 
     /// Whether the answer must not be read from or written to the response caches.
@@ -1106,7 +1134,7 @@ impl RequestLimits {
         if self
             .req_query_count
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < MAX_QUERIES_PER_REQUEST).then(|| n + 1)
+                (n < self.max_queries).then(|| n + 1)
             })
             .is_err()
         {
@@ -1174,8 +1202,8 @@ mod for_dnssec {
 
             let this = self.clone();
             stream::once(async move {
-                this.resolve_for_validation(query, &RequestLimits::new())
-                    .await
+                let limits = RequestLimits::new(this.max_queries_per_request);
+                this.resolve_for_validation(query, &limits).await
             })
             .boxed()
         }
@@ -1279,9 +1307,6 @@ const MAX_CNAME_LOOKUPS: u8 = 64;
 
 /// Maximum number of glueless NS targets to chase per delegation point.
 const MAX_GLUELESS_FOLLOW: usize = 5;
-
-/// Maximum number of upstream queries the recursor will issue for a single client query.
-const MAX_QUERIES_PER_REQUEST: u8 = 200;
 
 #[cfg(test)]
 mod tests {

@@ -57,7 +57,9 @@ mod error;
 pub use error::{AuthorityData, RecursorError};
 
 mod handle;
-use handle::{RecursorDnsHandle, RequestLimits};
+use handle::RecursorDnsHandle;
+#[cfg(feature = "__dnssec")]
+use handle::RequestLimits;
 
 #[cfg(test)]
 mod tests;
@@ -372,7 +374,7 @@ impl<P: ConnectionProvider> Recursor<P> {
         query_has_dnssec_ok: bool,
         options: ResolveOptions,
     ) -> Resolution {
-        let limits = match RequestLimits::with_options(options) {
+        let limits = match self.handle().request_limits(options) {
             Ok(limits) => limits,
             Err(e) => {
                 return Resolution {
@@ -411,10 +413,14 @@ impl<P: ConnectionProvider> Recursor<P> {
 
     /// Get the recursor's [`PoolContext`].
     pub fn pool_context(&self) -> &Arc<PoolContext> {
+        self.handle().pool_context()
+    }
+
+    fn handle(&self) -> &RecursorDnsHandle<P> {
         match &self.mode {
-            RecursorMode::NonValidating { handle, .. } => handle.pool_context(),
+            RecursorMode::NonValidating { handle, .. } => handle,
             #[cfg(feature = "__dnssec")]
-            RecursorMode::Validating(validating) => validating.handle.inner().pool_context(),
+            RecursorMode::Validating(validating) => validating.handle.inner(),
         }
     }
 
@@ -491,6 +497,16 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
         query_has_dnssec_ok: bool,
         limits: &RequestLimits,
     ) -> Result<Message, RecursorError> {
+        // The client validates (RFC 4035 section 3.2.2): answer as a non-validating recursor and
+        // leave the validated response cache alone.
+        if limits.checking_disabled() {
+            return self
+                .handle
+                .inner()
+                .resolve(query, request_time, query_has_dnssec_ok, 0, limits)
+                .await;
+        }
+
         let use_cache = !limits.bypass_response_cache();
         if let Some(Ok(response)) = use_cache
             .then(|| self.validated_response_cache.get(&query, request_time))
@@ -614,6 +630,13 @@ pub struct ResolveOptions {
     /// Use this when the caller keeps its own answer cache. Delegation, name server and DNSSEC
     /// validation caches remain in use.
     pub bypass_response_cache: bool,
+
+    /// Do not validate this request's answer (the client set CD, RFC 4035 section 3.2.2)
+    ///
+    /// A validating recursor answers as a non-validating one: records keep their indeterminate
+    /// proofs, and the validated response cache is neither read nor written. Without validation
+    /// this has no effect.
+    pub checking_disabled: bool,
 }
 
 /// The result of [`Recursor::resolve_with`]
@@ -749,6 +772,12 @@ pub struct RecursorOptions {
         )
     )]
     pub server_attempt_timeout: Duration,
+
+    /// Maximum number of upstream queries for one client request, including the queries for
+    /// delegations, name server addresses and CNAME targets. Each DS or DNSKEY lookup made for
+    /// DNSSEC validation gets a budget of its own. Must be nonzero. Defaults to 200.
+    #[cfg_attr(feature = "serde", serde(default = "default_max_queries_per_request"))]
+    pub max_queries_per_request: u16,
 }
 
 impl Default for RecursorOptions {
@@ -769,6 +798,7 @@ impl Default for RecursorOptions {
             edns_payload_len: default_edns_payload_len(),
             qname_minimization: QNameMinimization::default(),
             server_attempt_timeout: default_server_attempt_timeout(),
+            max_queries_per_request: default_max_queries_per_request(),
         }
     }
 }
@@ -804,6 +834,10 @@ fn default_edns_payload_len() -> u16 {
 
 fn default_server_attempt_timeout() -> Duration {
     Duration::from_millis(1_500)
+}
+
+fn default_max_queries_per_request() -> u16 {
+    200
 }
 
 /// `Recursor`'s DNSSEC policy
