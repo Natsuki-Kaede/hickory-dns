@@ -363,6 +363,12 @@ impl<P: ConnectionProvider> NameServer<P> {
         self.server_srtt.record(winner_rtt + CANCEL_PENALTY);
     }
 
+    /// Records a failure for a server whose request was abandoned after the pool's attempt
+    /// timeout, so that the server is deprioritized like one whose request timed out.
+    pub(super) fn record_attempt_timeout(&self) {
+        self.server_srtt.record_failure();
+    }
+
     #[cfg(test)]
     pub(crate) fn test_record_failure(&self) {
         self.server_srtt.record_failure();

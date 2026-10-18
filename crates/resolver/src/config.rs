@@ -519,6 +519,12 @@ pub struct ResolverOpts {
         serde(default = "default_timeout", with = "duration")
     )]
     pub timeout: Duration,
+    /// Optional timeout for a single attempt at one name server of a pool.
+    ///
+    /// When an attempt takes longer, the pool tries its next name server within the overall
+    /// `timeout`. Defaults to `None`, where an attempt may use the whole `timeout`.
+    #[cfg_attr(feature = "serde", serde(with = "duration_opt"))]
+    pub server_attempt_timeout: Option<Duration>,
     /// Number of retries after lookup failure before giving up. Defaults to 2
     #[cfg_attr(feature = "serde", serde(default = "default_attempts"))]
     pub attempts: usize,
@@ -650,6 +656,7 @@ impl Default for ResolverOpts {
         Self {
             ndots: default_ndots(),
             timeout: default_timeout(),
+            server_attempt_timeout: None,
             attempts: default_attempts(),
             edns0: true,
             #[cfg(feature = "__dnssec")]

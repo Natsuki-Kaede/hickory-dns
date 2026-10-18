@@ -819,6 +819,22 @@ fn validate_response(response: Message, name: &Name, ip: IpAddr) -> bool {
         && response.answers == [Record::from_rdata(name.clone(), 0, ip.into())]
 }
 
+#[tokio::test]
+async fn server_attempt_timeout_configures_name_server_pools() {
+    let (provider, options) = test_fixture().unwrap();
+    let recursor = Recursor::with_options(&[ROOT_IP], options.clone(), provider.clone()).unwrap();
+    assert_eq!(
+        recursor.pool_context().options.server_attempt_timeout,
+        Some(RecursorOptions::default().server_attempt_timeout)
+    );
+
+    let options = RecursorOptions {
+        server_attempt_timeout: Duration::ZERO,
+        ..options
+    };
+    assert!(Recursor::with_options(&[ROOT_IP], options, provider).is_err());
+}
+
 fn test_fixture() -> Result<(MockProvider, RecursorOptions), NetError> {
     let query_name = Name::from_ascii("host.hickory-dns.testing.")?;
     let dup_query_name = Name::from_ascii("host.hickory-dns-dup.testing.")?;

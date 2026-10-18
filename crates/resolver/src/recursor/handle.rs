@@ -94,7 +94,14 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             opportunistic_encryption,
             edns_payload_len,
             qname_minimization,
+            server_attempt_timeout,
         } = options;
+
+        if server_attempt_timeout.is_zero() {
+            return Err(RecursorError::from(
+                "server_attempt_timeout must be nonzero",
+            ));
+        }
 
         let avoid_local_udp_ports = Arc::new(avoid_local_udp_ports);
 
@@ -108,6 +115,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 avoid_local_udp_ports.clone(),
                 case_randomization,
                 edns_payload_len,
+                server_attempt_timeout,
             ),
             tls,
         )
@@ -1231,8 +1239,10 @@ fn recursor_opts(
     avoid_local_udp_ports: Arc<HashSet<u16>>,
     case_randomization: bool,
     edns_payload_len: u16,
+    server_attempt_timeout: Duration,
 ) -> ResolverOpts {
     ResolverOpts {
+        server_attempt_timeout: Some(server_attempt_timeout),
         ndots: 0,
         edns0: true,
         #[cfg(feature = "__dnssec")]

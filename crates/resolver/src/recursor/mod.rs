@@ -17,7 +17,7 @@ use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ipnet::IpNet;
@@ -735,6 +735,20 @@ pub struct RecursorOptions {
     /// Configure QNAME minimization.
     #[cfg_attr(feature = "serde", serde(default))]
     pub qname_minimization: QNameMinimization,
+
+    /// Timeout for one attempt at a single authoritative name server.
+    ///
+    /// When an attempt takes longer, the recursor tries the zone's next name server within the
+    /// overall query timeout, so unreachable servers do not consume the whole budget. Must be
+    /// nonzero. Defaults to 1.5 seconds.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default = "default_server_attempt_timeout",
+            with = "crate::config::duration"
+        )
+    )]
+    pub server_attempt_timeout: Duration,
 }
 
 impl Default for RecursorOptions {
@@ -754,6 +768,7 @@ impl Default for RecursorOptions {
             opportunistic_encryption: OpportunisticEncryption::default(),
             edns_payload_len: default_edns_payload_len(),
             qname_minimization: QNameMinimization::default(),
+            server_attempt_timeout: default_server_attempt_timeout(),
         }
     }
 }
@@ -785,6 +800,10 @@ fn deny_server_default() -> Vec<IpNet> {
 
 fn default_edns_payload_len() -> u16 {
     DEFAULT_MAX_PAYLOAD_LEN
+}
+
+fn default_server_attempt_timeout() -> Duration {
+    Duration::from_millis(1_500)
 }
 
 /// `Recursor`'s DNSSEC policy

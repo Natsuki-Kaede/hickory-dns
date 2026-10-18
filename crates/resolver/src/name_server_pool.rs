@@ -369,8 +369,28 @@ impl<P: ConnectionProvider> PoolState<P> {
                     request.options_mut().retry_interval = retry_interval;
                     debug!(?retry_interval, ip = ?server.ip(), "setting retry_interval");
 
-                    let future = server.clone().send(request, policy, &self.cx);
-                    async { (server, future.await) }
+                    let (attempt, cx) = (server.clone(), self.cx.clone());
+                    let future = async move { attempt.send(request, policy, &cx).await };
+                    let attempt_timeout = self.cx.options.server_attempt_timeout;
+                    async move {
+                        let Some(attempt_timeout) = attempt_timeout else {
+                            return (server, future.await);
+                        };
+
+                        // Bound the attempt, but never past the pool deadline.
+                        let limit =
+                            attempt_timeout.min(deadline.saturating_duration_since(Instant::now()));
+                        let result = <<P as ConnectionProvider>::RuntimeProvider as RuntimeProvider>::Timer::timeout(
+                            limit, future,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            debug!(ip = ?server.ip(), ?limit, "name server attempt timed out");
+                            server.record_attempt_timeout();
+                            Err(NetError::Timeout)
+                        });
+                        (server, result)
+                    }
                 })
                 .collect::<FuturesUnordered<_>>();
 
@@ -1395,6 +1415,67 @@ mod tests {
             ns_good.decayed_srtt() < failure_penalty,
             "good server SRTT should not be penalized: {}",
             ns_good.decayed_srtt(),
+        );
+    }
+
+    /// With an attempt timeout, a server that never answers costs only that timeout and the
+    /// pool moves on to the next server within the overall deadline, even when requests are
+    /// sent to one server at a time (as the recursor does).
+    #[tokio::test]
+    async fn test_attempt_timeout_tries_next_server() {
+        subscribe();
+
+        let unreachable_ip = IpAddr::from([10, 0, 0, 1]);
+        let good_ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        let responses = vec![MockRecord::a(good_ip, &query_name, good_ip)];
+        let handler = MockNetworkHandler::new(responses);
+        let mock_provider = MockProvider::new(handler);
+        let provider = PendingProvider::new(mock_provider, vec![unreachable_ip]);
+
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 1,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            timeout: Duration::from_secs(5),
+            server_attempt_timeout: Some(Duration::from_millis(100)),
+            ..ResolverOpts::default()
+        };
+
+        let ns_unreachable = Arc::new(NameServer::new(
+            [].into_iter(),
+            NameServerConfig::udp(unreachable_ip),
+            &opts,
+            provider.clone(),
+        ));
+        let ns_good = Arc::new(NameServer::new(
+            [].into_iter(),
+            NameServerConfig::udp(good_ip),
+            &opts,
+            provider.clone(),
+        ));
+        let initial_srtt = ns_unreachable.decayed_srtt();
+
+        let pool = NameServerPool::from_nameservers(
+            vec![ns_unreachable.clone(), ns_good],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        let lookup = pool
+            .lookup(
+                Query::query(query_name, RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer();
+        let response = tokio::time::timeout(Duration::from_secs(2), lookup)
+            .await
+            .expect("the unreachable server consumed the lookup budget")
+            .expect("lookup should succeed via the second server");
+        assert!(!response.answers.is_empty());
+
+        assert!(
+            ns_unreachable.decayed_srtt() > initial_srtt,
+            "a server whose attempt timed out should be deprioritized"
         );
     }
 
