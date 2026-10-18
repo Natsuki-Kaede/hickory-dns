@@ -39,17 +39,13 @@ use crate::{
     config::OpportunisticEncryption,
     proto::{
         op::{DEFAULT_MAX_PAYLOAD_LEN, Message, Query},
-        rr::Name,
+        rr::{Name, rdata::opt::ClientSubnet},
     },
 };
 #[cfg(feature = "__dnssec")]
 use crate::{
     ResponseCache,
-    net::{
-        DnsError, NetError, NoRecords,
-        dnssec::DnssecDnsHandle,
-        xfer::{DnsHandle as _, FirstAnswer as _},
-    },
+    net::{DnsError, NetError, NoRecords, dnssec::DnssecDnsHandle},
     proto::{
         dnssec::TrustAnchors,
         op::{DnsRequestOptions, ResponseCode},
@@ -345,31 +341,71 @@ impl<P: ConnectionProvider> Recursor<P> {
         request_time: Instant,
         query_has_dnssec_ok: bool,
     ) -> Result<Message, RecursorError> {
-        if !query.name().is_fqdn() {
-            return Err(RecursorError::from(
+        self.resolve_with(
+            query,
+            request_time,
+            query_has_dnssec_ok,
+            ResolveOptions::default(),
+        )
+        .await
+        .result
+    }
+
+    /// Perform a recursive resolution with per-request [`ResolveOptions`]
+    ///
+    /// This behaves like [`Recursor::resolve`], and additionally:
+    ///
+    /// * With [`ResolveOptions::client_subnet`], the queries for the answer (the question and any
+    ///   CNAME targets) sent to the authoritative name servers of the answer's zones carry that
+    ///   EDNS Client Subnet option ([RFC 7871](https://www.rfc-editor.org/rfc/rfc7871)). Queries
+    ///   made to find delegations, name server addresses and DNSSEC keys never carry it, so root,
+    ///   TLD and other parent zone servers do not see the client subnet. The authoritative ECS
+    ///   scope is reported in [`Resolution::ecs_scope`].
+    /// * Answers for a request with a client subnet, or with
+    ///   [`ResolveOptions::bypass_response_cache`], are neither read from nor written to the
+    ///   recursor's response caches. Delegations, name server pools and DNSSEC validation state
+    ///   are still cached and shared by all requests.
+    pub async fn resolve_with(
+        &self,
+        query: Query,
+        request_time: Instant,
+        query_has_dnssec_ok: bool,
+        options: ResolveOptions,
+    ) -> Resolution {
+        let limits = match RequestLimits::with_options(options) {
+            Ok(limits) => limits,
+            Err(e) => {
+                return Resolution {
+                    result: Err(e),
+                    ecs_scope: EcsScope::NotSent,
+                };
+            }
+        };
+
+        let result = if !query.name().is_fqdn() {
+            Err(RecursorError::from(
                 "query's domain name must be fully qualified",
-            ));
-        }
+            ))
+        } else {
+            match &self.mode {
+                RecursorMode::NonValidating { handle } => {
+                    handle
+                        .resolve(query, request_time, query_has_dnssec_ok, 0, &limits)
+                        .await
+                }
 
-        match &self.mode {
-            RecursorMode::NonValidating { handle } => {
-                handle
-                    .resolve(
-                        query,
-                        request_time,
-                        query_has_dnssec_ok,
-                        0,
-                        &RequestLimits::new(),
-                    )
-                    .await
+                #[cfg(feature = "__dnssec")]
+                RecursorMode::Validating(validating) => {
+                    validating
+                        .resolve(query, request_time, query_has_dnssec_ok, &limits)
+                        .await
+                }
             }
+        };
 
-            #[cfg(feature = "__dnssec")]
-            RecursorMode::Validating(validating) => {
-                validating
-                    .resolve(query, request_time, query_has_dnssec_ok)
-                    .await
-            }
+        Resolution {
+            result,
+            ecs_scope: limits.ecs_scope(),
         }
     }
 
@@ -453,8 +489,13 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
         query: Query,
         request_time: Instant,
         query_has_dnssec_ok: bool,
+        limits: &RequestLimits,
     ) -> Result<Message, RecursorError> {
-        if let Some(Ok(response)) = self.validated_response_cache.get(&query, request_time) {
+        let use_cache = !limits.bypass_response_cache();
+        if let Some(Ok(response)) = use_cache
+            .then(|| self.validated_response_cache.get(&query, request_time))
+            .flatten()
+        {
             // Increment metrics on cache hits only. We will check the cache a second time
             // inside resolve(), thus we only track cache misses there.
             #[cfg(feature = "metrics")]
@@ -489,11 +530,14 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
         options.use_edns = true;
         options.edns_set_dnssec_ok = true;
 
-        let response = self
+        // Resolve the question with the request's options, then validate it like a response
+        // obtained through `DnssecDnsHandle::send()`.
+        let result = self
             .handle
-            .lookup(query.clone(), options)
-            .first_answer()
-            .await?;
+            .inner()
+            .resolve_for_validation(query.clone(), limits)
+            .await;
+        let response = self.handle.verify(query.clone(), options, result).await?;
 
         // Return NXDomain and NoData responses in error form
         // These need to bypass the cache lookup (and casting to a Lookup object in general)
@@ -536,8 +580,13 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
             self.metrics
                 .dnssec_metrics
                 .increment_proof_counter(&message);
-            self.validated_response_cache
-                .insert(query.clone(), Ok(message.clone()), request_time);
+            if use_cache {
+                self.validated_response_cache.insert(
+                    query.clone(),
+                    Ok(message.clone()),
+                    request_time,
+                );
+            }
             #[cfg(feature = "metrics")]
             self.metrics
                 .validated_cache_size
@@ -545,6 +594,53 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
             Ok(message.maybe_strip_dnssec_records(query_has_dnssec_ok))
         }
     }
+}
+
+/// Per-request options for [`Recursor::resolve_with`]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ResolveOptions {
+    /// EDNS Client Subnet to send with the queries for the answer
+    ///
+    /// `None` sends no ECS option. A source prefix length of 0 asks authoritative servers not to
+    /// tailor the answer to the client ([RFC 7871](https://www.rfc-editor.org/rfc/rfc7871)).
+    /// Address bits beyond the source prefix length are cleared and the scope prefix length is
+    /// sent as 0. A request with a client subnet always bypasses the response caches.
+    pub client_subnet: Option<ClientSubnet>,
+
+    /// Neither read nor write the response caches for this request's answer
+    ///
+    /// Use this when the caller keeps its own answer cache. Delegation, name server and DNSSEC
+    /// validation caches remain in use.
+    pub bypass_response_cache: bool,
+}
+
+/// The result of [`Recursor::resolve_with`]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Resolution {
+    /// The response or error, as returned by [`Recursor::resolve`]
+    pub result: Result<Message, RecursorError>,
+    /// The EDNS Client Subnet scope of the answer
+    pub ecs_scope: EcsScope,
+}
+
+/// The EDNS Client Subnet scope reported by the authoritative servers that produced an answer
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EcsScope {
+    /// The request had no client subnet, so none was sent.
+    NotSent,
+    /// A client subnet was requested, but no response used for the answer carried an ECS option.
+    ///
+    /// [RFC 7871](https://www.rfc-editor.org/rfc/rfc7871) treats such an answer as suitable for
+    /// all clients (equivalent to scope 0). This includes negative answers
+    /// learned from delegation queries, which never carry ECS.
+    Absent,
+    /// The largest SCOPE PREFIX-LENGTH among the responses used for the answer (positive or
+    /// negative, including each CNAME target). It can exceed the source prefix length; RFC 7871
+    /// describes how to cache such answers.
+    Scope(u8),
 }
 
 /// Configuration for recursive resolver zones

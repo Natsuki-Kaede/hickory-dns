@@ -1194,6 +1194,397 @@ async fn empty_ns_pool_not_cached_on_glueless_failure() -> Result<(), NetError> 
 
 mod ghost_domain;
 
+mod ecs {
+    use std::{collections::HashMap, sync::Mutex};
+
+    use test_support::MockHandler;
+
+    use super::*;
+    #[cfg(feature = "__dnssec")]
+    use crate::recursor::{DnssecConfig, DnssecPolicy};
+    use crate::{
+        proto::{
+            op::{Edns, OpCode},
+            rr::{
+                RData,
+                rdata::{
+                    CNAME,
+                    opt::{ClientSubnet, EdnsCode, EdnsOption},
+                },
+            },
+        },
+        recursor::{EcsScope, ResolveOptions},
+    };
+
+    type SeenQueries = Arc<Mutex<Vec<(IpAddr, Query, Option<ClientSubnet>)>>>;
+
+    /// Records the ECS option of every query and echoes it with a per-name scope.
+    struct EcsHandler {
+        inner: MockNetworkHandler,
+        scopes: HashMap<Name, u8>,
+        echo_source_prefix: Option<u8>,
+        seen: SeenQueries,
+    }
+
+    impl MockHandler for EcsHandler {
+        fn handle(&self, destination: IpAddr, protocol: Protocol, request: Message) -> Message {
+            let query = request.queries[0].clone();
+            let sent = request
+                .edns
+                .as_ref()
+                .and_then(|edns| match edns.option(EdnsCode::Subnet) {
+                    Some(EdnsOption::Subnet(subnet)) => Some(*subnet),
+                    _ => None,
+                });
+            self.seen
+                .lock()
+                .unwrap()
+                .push((destination, query.clone(), sent));
+
+            let alias = name("alias.hickory-dns.testing.");
+            let mut response = if destination == LEAF_IP
+                && query.name() == &alias
+                && query.query_type() == RecordType::A
+            {
+                let mut response = Message::response(request.id, OpCode::Query);
+                response.add_query(query.clone());
+                response.metadata.authoritative = true;
+                response.add_answer(Record::from_rdata(
+                    alias,
+                    300,
+                    RData::CNAME(CNAME(name("host.hickory-dns.testing."))),
+                ));
+                response
+            } else {
+                self.inner.handle(destination, protocol, request)
+            };
+
+            if let (Some(sent), Some(scope)) = (sent, self.scopes.get(query.name())) {
+                let mut edns = Edns::new();
+                edns.options_mut()
+                    .insert(EdnsOption::Subnet(ClientSubnet::new(
+                        sent.addr(),
+                        self.echo_source_prefix
+                            .unwrap_or_else(|| sent.source_prefix()),
+                        *scope,
+                    )));
+                response.edns = Some(edns);
+            }
+
+            response
+        }
+    }
+
+    struct Fixture {
+        recursor: Recursor<MockProvider>,
+        seen: SeenQueries,
+    }
+
+    impl Fixture {
+        fn new(scopes: &[(&str, u8)]) -> Self {
+            Self::build(scopes, None, false)
+        }
+
+        fn build(scopes: &[(&str, u8)], echo_source_prefix: Option<u8>, validating: bool) -> Self {
+            subscribe();
+            let tld_zone = name("testing.");
+            let tld_ns = name("testing.testing.");
+            let leaf_zone = name("hickory-dns.testing.");
+            let leaf_ns = name("ns.hickory-dns.testing.");
+            let nodata = name("nodata.hickory-dns.testing.");
+
+            let responses = vec![
+                MockRecord::ns(ROOT_IP, &tld_zone, &tld_ns),
+                MockRecord::a(ROOT_IP, &tld_ns, TLD_IP)
+                    .with_query_name(&tld_zone)
+                    .with_query_type(RecordType::NS)
+                    .with_section(MockResponseSection::Additional),
+                MockRecord::ns(TLD_IP, &leaf_zone, &leaf_ns),
+                MockRecord::a(TLD_IP, &leaf_ns, LEAF_IP)
+                    .with_query_name(&leaf_zone)
+                    .with_query_type(RecordType::NS)
+                    .with_section(MockResponseSection::Additional),
+                MockRecord::a(LEAF_IP, &name("host.hickory-dns.testing."), LEAF_IP),
+                MockRecord::soa(LEAF_IP, &leaf_zone, &leaf_ns, &leaf_ns)
+                    .with_query_name(&nodata)
+                    .with_query_type(RecordType::A)
+                    .with_ttl(3600),
+            ];
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let handler = EcsHandler {
+                inner: MockNetworkHandler::new(responses),
+                scopes: scopes.iter().map(|(n, s)| (name(n), *s)).collect(),
+                echo_source_prefix,
+                seen: seen.clone(),
+            };
+
+            let options = RecursorOptions {
+                deny_server: Vec::new(),
+                ..RecursorOptions::default()
+            };
+            let provider = MockProvider::new(handler);
+            let recursor = if validating {
+                #[cfg(feature = "__dnssec")]
+                {
+                    Recursor::new(
+                        &[ROOT_IP],
+                        DnssecPolicy::ValidateWithStaticKey(DnssecConfig::default()),
+                        None,
+                        options,
+                        provider,
+                    )
+                    .unwrap()
+                }
+                #[cfg(not(feature = "__dnssec"))]
+                unreachable!()
+            } else {
+                Recursor::with_options(&[ROOT_IP], options, provider).unwrap()
+            };
+
+            Self { recursor, seen }
+        }
+
+        async fn resolve(&self, qname: &str, options: ResolveOptions) -> Resolution {
+            self.recursor
+                .resolve_with(
+                    Query::query(name(qname), RecordType::A),
+                    Instant::now(),
+                    false,
+                    options,
+                )
+                .await
+        }
+
+        /// ECS options sent with `qname`/A queries to `ip`
+        fn sent(&self, ip: IpAddr, qname: &str) -> Vec<Option<ClientSubnet>> {
+            let qname = name(qname);
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(dest, query, _)| {
+                    *dest == ip && query.name() == &qname && query.query_type() == RecordType::A
+                })
+                .map(|(_, _, ecs)| *ecs)
+                .collect()
+        }
+
+        /// All queries other than `qname`/A to LEAF_IP must not carry ECS.
+        fn assert_no_ecs_except_answers(&self, answers: &[&str]) {
+            let answers = answers.iter().map(|n| name(n)).collect::<Vec<_>>();
+            for (dest, query, ecs) in self.seen.lock().unwrap().iter() {
+                let answer = *dest == LEAF_IP
+                    && query.query_type() == RecordType::A
+                    && answers.contains(query.name());
+                if !answer {
+                    assert_eq!(*ecs, None, "{query} to {dest} carried ECS");
+                }
+            }
+        }
+    }
+
+    use super::super::Resolution;
+
+    fn name(name: &str) -> Name {
+        Name::from_ascii(name).unwrap()
+    }
+
+    fn subnet(net: &str) -> ResolveOptions {
+        ResolveOptions {
+            client_subnet: Some(net.parse().unwrap()),
+            ..ResolveOptions::default()
+        }
+    }
+
+    const HOST: &str = "host.hickory-dns.testing.";
+
+    #[tokio::test]
+    async fn ecs_sent_only_with_answer_queries_and_scope_returned() {
+        let fixture = Fixture::new(&[(HOST, 24)]);
+
+        // Address bits beyond the source prefix are cleared on the wire.
+        let resolution = fixture.resolve(HOST, subnet("198.51.100.77/24")).await;
+        let response = resolution.result.unwrap();
+        assert!(validate_response(response, &name(HOST), LEAF_IP));
+        assert_eq!(resolution.ecs_scope, EcsScope::Scope(24));
+
+        assert_eq!(
+            fixture.sent(LEAF_IP, HOST),
+            [Some("198.51.100.0/24".parse().unwrap())]
+        );
+        fixture.assert_no_ecs_except_answers(&[HOST]);
+    }
+
+    #[tokio::test]
+    async fn ecs_privacy_prefix_and_absent_scope() {
+        let fixture = Fixture::new(&[]);
+
+        let resolution = fixture.resolve(HOST, subnet("0.0.0.0/0")).await;
+        assert!(resolution.result.is_ok());
+        assert_eq!(resolution.ecs_scope, EcsScope::Absent);
+        assert_eq!(
+            fixture.sent(LEAF_IP, HOST),
+            [Some("0.0.0.0/0".parse().unwrap())]
+        );
+
+        let resolution = fixture.resolve(HOST, ResolveOptions::default()).await;
+        assert!(resolution.result.is_ok());
+        assert_eq!(resolution.ecs_scope, EcsScope::NotSent);
+    }
+
+    #[tokio::test]
+    async fn ecs_bypasses_response_cache_but_not_delegations() {
+        let fixture = Fixture::new(&[(HOST, 24)]);
+
+        for net in ["198.51.100.0/24", "203.0.113.0/24", "198.51.100.0/24"] {
+            let resolution = fixture.resolve(HOST, subnet(net)).await;
+            assert!(resolution.result.is_ok());
+            assert_eq!(resolution.ecs_scope, EcsScope::Scope(24));
+        }
+        assert_eq!(
+            fixture.sent(LEAF_IP, HOST),
+            [
+                Some("198.51.100.0/24".parse().unwrap()),
+                Some("203.0.113.0/24".parse().unwrap()),
+                Some("198.51.100.0/24".parse().unwrap()),
+            ]
+        );
+
+        // Delegations were resolved once and then served from the name server cache.
+        let root_queries = fixture
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(dest, ..)| *dest == ROOT_IP)
+            .count();
+        assert_eq!(root_queries, 1);
+
+        // ECS answers were not cached: the default path queries once, then uses its cache.
+        for _ in 0..2 {
+            let response = fixture
+                .recursor
+                .resolve(
+                    Query::query(name(HOST), RecordType::A),
+                    Instant::now(),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(validate_response(response, &name(HOST), LEAF_IP));
+        }
+        assert_eq!(fixture.sent(LEAF_IP, HOST).len(), 4);
+        assert_eq!(fixture.sent(LEAF_IP, HOST)[3], None);
+    }
+
+    #[tokio::test]
+    async fn bypass_without_ecs_queries_every_time() {
+        let fixture = Fixture::new(&[]);
+        let options = ResolveOptions {
+            bypass_response_cache: true,
+            ..ResolveOptions::default()
+        };
+
+        for _ in 0..2 {
+            let resolution = fixture.resolve(HOST, options).await;
+            assert!(resolution.result.is_ok());
+            assert_eq!(resolution.ecs_scope, EcsScope::NotSent);
+        }
+        assert_eq!(fixture.sent(LEAF_IP, HOST), [None, None]);
+    }
+
+    #[tokio::test]
+    async fn ecs_follows_cname_targets_with_largest_scope() {
+        let alias = "alias.hickory-dns.testing.";
+        let fixture = Fixture::new(&[(alias, 0), (HOST, 20)]);
+
+        let resolution = fixture.resolve(alias, subnet("198.51.100.0/24")).await;
+        let response = resolution.result.unwrap();
+        assert_eq!(response.answers.len(), 2);
+        assert_eq!(resolution.ecs_scope, EcsScope::Scope(20));
+
+        let ecs = Some("198.51.100.0/24".parse().unwrap());
+        assert_eq!(fixture.sent(LEAF_IP, alias), [ecs]);
+        assert_eq!(fixture.sent(LEAF_IP, HOST), [ecs]);
+        fixture.assert_no_ecs_except_answers(&[alias, HOST]);
+    }
+
+    #[tokio::test]
+    async fn ecs_scope_of_negative_answer() {
+        let nodata = "nodata.hickory-dns.testing.";
+        let fixture = Fixture::new(&[(nodata, 16)]);
+
+        let resolution = fixture.resolve(nodata, subnet("198.51.100.0/24")).await;
+        assert!(resolution.result.unwrap_err().is_no_records_found());
+        assert_eq!(resolution.ecs_scope, EcsScope::Scope(16));
+
+        // The negative answer was not cached for other subnets.
+        let resolution = fixture.resolve(nodata, subnet("203.0.113.0/24")).await;
+        assert!(resolution.result.is_err());
+        assert_eq!(fixture.sent(LEAF_IP, nodata).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ecs_mismatched_echo_is_rejected() {
+        let fixture = Fixture::build(&[(HOST, 24)], Some(16), false);
+
+        let resolution = fixture.resolve(HOST, subnet("198.51.100.0/24")).await;
+        assert!(resolution.result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ecs_invalid_source_prefix_is_rejected() {
+        let fixture = Fixture::new(&[]);
+        let options = ResolveOptions {
+            client_subnet: Some(ClientSubnet::new(IpAddr::from([198, 51, 100, 0]), 33, 0)),
+            ..ResolveOptions::default()
+        };
+
+        let resolution = fixture.resolve(HOST, options).await;
+        assert!(resolution.result.is_err());
+        assert!(fixture.seen.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "__dnssec")]
+    #[tokio::test]
+    async fn ecs_with_validating_recursor() {
+        let fixture = Fixture::build(&[(HOST, 24)], None, true);
+
+        for net in ["198.51.100.0/24", "203.0.113.0/24"] {
+            let resolution = fixture.resolve(HOST, subnet(net)).await;
+            let response = resolution.result.unwrap();
+            assert_eq!(response.response_code, ResponseCode::NoError);
+            assert_eq!(resolution.ecs_scope, EcsScope::Scope(24));
+        }
+
+        // Each subnet got a fresh answer; no other query carried ECS.
+        assert_eq!(
+            fixture.sent(LEAF_IP, HOST),
+            [
+                Some("198.51.100.0/24".parse().unwrap()),
+                Some("203.0.113.0/24".parse().unwrap()),
+            ]
+        );
+        fixture.assert_no_ecs_except_answers(&[HOST]);
+
+        // The default path still caches validated answers.
+        for _ in 0..2 {
+            let response = fixture
+                .recursor
+                .resolve(
+                    Query::query(name(HOST), RecordType::A),
+                    Instant::now(),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.response_code, ResponseCode::NoError);
+        }
+        assert_eq!(fixture.sent(LEAF_IP, HOST).len(), 3);
+    }
+}
+
 const ROOT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
 const TLD_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
 const LEAF_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 3, 1));

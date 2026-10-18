@@ -10,13 +10,14 @@ use std::{
 
 use async_recursion::async_recursion;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use ipnet::IpNet;
 use lru_cache::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
 use super::{
-    DnssecPolicy, QNameMinimization, RecursorError, RecursorOptions, error::AuthorityData,
-    is_subzone,
+    DnssecPolicy, EcsScope, QNameMinimization, RecursorError, RecursorOptions, ResolveOptions,
+    error::AuthorityData, is_subzone,
 };
 #[cfg(feature = "metrics")]
 use crate::metrics::recursor::RecursorMetrics;
@@ -31,12 +32,15 @@ use crate::{
     net::{DnsError, DnsHandle, NetError, NoRecords},
     proto::{
         access_control::{AccessControlSet, AccessControlSetBuilder},
-        op::{DnsRequestOptions, Message, Query},
+        op::{DnsRequest, DnsRequestOptions, Edns, Message, Query},
         rr::{
             Name, RData,
             RData::CNAME,
             Record, RecordType,
-            rdata::{A, AAAA, NS},
+            rdata::{
+                A, AAAA, NS,
+                opt::{ClientSubnet, EdnsCode, EdnsOption},
+            },
         },
     },
 };
@@ -171,7 +175,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         #[cfg(feature = "metrics")]
         let _guard = self.metrics.new_inflight_query();
 
-        if let Some(result) = self.response_cache.get(&query, request_time) {
+        let use_cache = !limits.bypass_response_cache();
+        if let Some(result) = use_cache
+            .then(|| self.response_cache.get(&query, request_time))
+            .flatten()
+        {
             let response = result?;
             if response.authoritative {
                 #[cfg(feature = "metrics")]
@@ -265,11 +273,13 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         debug!(%zone, %query, "found zone for query");
 
-        let cached_response = self.filtered_cache_lookup(&query, request_time);
+        let cached_response = use_cache
+            .then(|| self.filtered_cache_lookup(&query, request_time))
+            .flatten();
         let response = match cached_response {
             Some(result) => result?,
             None => {
-                self.lookup(query.clone(), zone, &ns, request_time, limits)
+                self.lookup(query.clone(), zone, &ns, request_time, limits, true)
                     .await?
             }
         };
@@ -437,6 +447,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         Some(Ok(response))
     }
 
+    /// Send `query` to `ns`, the name servers for `zone`.
+    ///
+    /// `answer` is true when the query asks for the answer to the request (the question or a CNAME
+    /// target) rather than for a delegation; only such queries carry the request's client subnet
+    /// and honor its response cache bypass.
     async fn lookup(
         &self,
         query: Query,
@@ -444,10 +459,26 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         ns: &NameServerPool<P>,
         now: Instant,
         limits: &RequestLimits,
+        answer: bool,
     ) -> Result<Message, RecursorError> {
         limits.try_charge_query(&query)?;
 
-        let mut response = ns.lookup(query.clone(), self.request_options);
+        let client_subnet = limits.client_subnet().filter(|_| answer);
+        let use_cache = !(answer && limits.bypass_response_cache());
+        let mut response = match client_subnet {
+            None => ns.lookup(query.clone(), self.request_options),
+            Some(subnet) => {
+                let mut options = self.request_options;
+                options.case_randomization = ns.context().options.case_randomization;
+                let mut request = DnsRequest::from_query(query.clone(), options);
+                request
+                    .edns
+                    .get_or_insert_with(Edns::new)
+                    .options_mut()
+                    .insert(EdnsOption::Subnet(subnet));
+                ns.send(request)
+            }
+        };
 
         #[cfg(feature = "metrics")]
         self.metrics.outgoing_query_counter.increment(1);
@@ -470,6 +501,17 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             Some(Ok(r)) => r,
             Some(Err(mut error)) => {
                 warn!(?query, %error, "lookup error");
+
+                if let (
+                    Some(sent),
+                    NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                        client_subnet: received,
+                        ..
+                    })),
+                ) = (&client_subnet, &error)
+                {
+                    limits.record_ecs_response(sent, received.as_ref())?;
+                }
 
                 // Do bailiwick filtering on records embedded in the error, if applicable.
                 match &mut error {
@@ -507,13 +549,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
 
                 // Ghost domain attack mitigation: see below
-                let query_type_is_ns = query.query_type == RecordType::NS;
-                self.response_cache.upsert_clamped_ttl(
-                    query,
-                    Err(error.clone()),
-                    now,
-                    query_type_is_ns,
-                );
+                if use_cache {
+                    let query_type_is_ns = query.query_type == RecordType::NS;
+                    self.response_cache.upsert_clamped_ttl(
+                        query,
+                        Err(error.clone()),
+                        now,
+                        query_type_is_ns,
+                    );
+                }
 
                 return Err(RecursorError::from(error));
             }
@@ -522,6 +566,18 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 return Err("no response to lookup".into());
             }
         };
+
+        if let Some(sent) = &client_subnet {
+            let received =
+                response
+                    .edns
+                    .as_ref()
+                    .and_then(|edns| match edns.option(EdnsCode::Subnet) {
+                        Some(EdnsOption::Subnet(subnet)) => Some(subnet),
+                        _ => None,
+                    });
+            limits.record_ecs_response(sent, received)?;
+        }
 
         let answers_len = response.answers.len();
         let authorities_len = response.authorities.len();
@@ -552,9 +608,15 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         // these queries. This lets us avoid extending the cache TTL of responses without consulting
         // the parent zone to check if the referral has changed. This workaround can be removed once
         // we handle caching of referrals and zone cuts differently.
-        let query_type_is_ns = query.query_type == RecordType::NS;
-        self.response_cache
-            .upsert_clamped_ttl(query, Ok(message.clone()), now, query_type_is_ns);
+        if use_cache {
+            let query_type_is_ns = query.query_type == RecordType::NS;
+            self.response_cache.upsert_clamped_ttl(
+                query,
+                Ok(message.clone()),
+                now,
+                query_type_is_ns,
+            );
+        }
         Ok(message)
     }
 
@@ -614,7 +676,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 }
                 Some(Err(e)) => Err(e.into()),
                 None => {
-                    self.lookup(query, &zone, &nameserver_pool, request_time, limits)
+                    self.lookup(query, &zone, &nameserver_pool, request_time, limits, false)
                         .await
                 }
             };
@@ -919,10 +981,14 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
     }
 }
 
+/// Per-request state: query budgets, the caller's [`ResolveOptions`] and the ECS scope seen.
 pub(crate) struct RequestLimits {
     req_query_count: AtomicU8,
     cname_limit: AtomicU8,
     in_flight_zones: Mutex<HashSet<Name>>,
+    options: ResolveOptions,
+    /// 0 while no answer response carried an ECS option, else the largest scope plus one.
+    ecs_scope: AtomicU8,
 }
 
 impl RequestLimits {
@@ -931,6 +997,82 @@ impl RequestLimits {
             req_query_count: AtomicU8::new(0),
             cname_limit: AtomicU8::new(0),
             in_flight_zones: Mutex::new(HashSet::new()),
+            options: ResolveOptions::default(),
+            ecs_scope: AtomicU8::new(0),
+        }
+    }
+
+    /// Per-request state for `options`; the client subnet is normalized for the wire.
+    pub(crate) fn with_options(mut options: ResolveOptions) -> Result<Self, RecursorError> {
+        if let Some(subnet) = &mut options.client_subnet {
+            let source_prefix = subnet.source_prefix();
+            let network = IpNet::new(subnet.addr(), source_prefix)
+                .map_err(|_| {
+                    RecursorError::from(format!(
+                        "invalid client subnet source prefix length {source_prefix}"
+                    ))
+                })?
+                .trunc();
+            *subnet = ClientSubnet::new(network.addr(), source_prefix, 0);
+        }
+
+        Ok(Self {
+            options,
+            ..Self::new()
+        })
+    }
+
+    pub(crate) fn client_subnet(&self) -> Option<ClientSubnet> {
+        self.options.client_subnet
+    }
+
+    /// Whether the answer must not be read from or written to the response caches.
+    pub(crate) fn bypass_response_cache(&self) -> bool {
+        self.options.bypass_response_cache || self.options.client_subnet.is_some()
+    }
+
+    /// Record the ECS option of a response to an answer query that carried `sent`.
+    ///
+    /// A response whose ECS option does not echo the family, source prefix length and address of
+    /// the query must be discarded (RFC 7871).
+    fn record_ecs_response(
+        &self,
+        sent: &ClientSubnet,
+        received: Option<&ClientSubnet>,
+    ) -> Result<(), RecursorError> {
+        let Some(received) = received else {
+            return Ok(());
+        };
+
+        let source_prefix = sent.source_prefix();
+        let echoed = received.source_prefix() == source_prefix
+            && received.addr().is_ipv4() == sent.addr().is_ipv4()
+            && IpNet::new(received.addr(), source_prefix).map(|net| net.trunc().addr())
+                == Ok(sent.addr());
+        if !echoed {
+            warn!(
+                ?sent,
+                ?received,
+                "discarding response with mismatched ECS option"
+            );
+            return Err(RecursorError::from(
+                "ECS option in response does not match the query",
+            ));
+        }
+
+        let scope = received.scope_prefix().saturating_add(1);
+        self.ecs_scope.fetch_max(scope, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn ecs_scope(&self) -> EcsScope {
+        if self.options.client_subnet.is_none() {
+            return EcsScope::NotSent;
+        }
+
+        match self.ecs_scope.load(Ordering::Relaxed) {
+            0 => EcsScope::Absent,
+            scope => EcsScope::Scope(scope - 1),
         }
     }
 
@@ -1006,27 +1148,38 @@ mod for_dnssec {
 
             let this = self.clone();
             stream::once(async move {
-                // request the DNSSEC records; we'll strip them if not needed on the caller side
-                let do_bit = true;
-
-                let limits = RequestLimits::new();
-                let future = this.resolve(query, Instant::now(), do_bit, 0, &limits);
-                let response = match future.await {
-                    Ok(response) => response,
-                    Err(e) => return Err(NetError::from(e)),
-                };
-
-                // `DnssecDnsHandle` will only look at the answer section of the message so
-                // we can put "stubs" in the other fields
-                let mut msg = Message::query();
-
-                msg.add_answers(response.answers.iter().cloned());
-                msg.add_authorities(response.authorities.iter().cloned());
-                msg.add_additionals(response.additionals.iter().cloned());
-
-                DnsResponse::from_message(msg.into_response()).map_err(NetError::from)
+                this.resolve_for_validation(query, &RequestLimits::new())
+                    .await
             })
             .boxed()
+        }
+    }
+
+    impl<P: ConnectionProvider> RecursorDnsHandle<P> {
+        /// Resolve `query` with `limits` into the response form `DnssecDnsHandle` validates.
+        pub(crate) async fn resolve_for_validation(
+            &self,
+            query: Query,
+            limits: &RequestLimits,
+        ) -> Result<DnsResponse, NetError> {
+            // request the DNSSEC records; we'll strip them if not needed on the caller side
+            let do_bit = true;
+
+            let future = self.resolve(query, Instant::now(), do_bit, 0, limits);
+            let response = match future.await {
+                Ok(response) => response,
+                Err(e) => return Err(NetError::from(e)),
+            };
+
+            // `DnssecDnsHandle` will only look at the answer section of the message so
+            // we can put "stubs" in the other fields
+            let mut msg = Message::query();
+
+            msg.add_answers(response.answers.iter().cloned());
+            msg.add_authorities(response.authorities.iter().cloned());
+            msg.add_additionals(response.additionals.iter().cloned());
+
+            DnsResponse::from_message(msg.into_response()).map_err(NetError::from)
         }
     }
 }
