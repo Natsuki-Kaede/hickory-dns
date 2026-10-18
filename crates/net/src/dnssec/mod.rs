@@ -774,6 +774,10 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                         break ancestor;
                     }
                 }
+                // Some zones publish no NS RRset at their apex; their SOA still marks the cut.
+                Err(NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                    soa: Some(soa), ..
+                }))) if soa.name == ancestor => break ancestor,
                 Err(e) if e.is_no_records_found() || e.is_nx_domain() => {}
                 Err(net) => {
                     return Err(ProofError::new(
@@ -786,8 +790,27 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             ancestor = ancestor.base_name();
         };
 
-        self.fetch_ds_records(zone, options).await?;
-        Ok(())
+        match self.fetch_ds_records(zone.clone(), options).await {
+            Err(error) if error.proof == Proof::Bogus => {
+                // A zone below a provably insecure zone is insecure (RFC 4035 section 4.3),
+                // whatever the parent's servers answer for its DS RRset; some answer DS queries
+                // for a delegated name with a referral.
+                let parent = zone.base_name();
+                if !parent.is_root() {
+                    if let Err(parent_error) = Box::pin(self.find_ds_records(parent, options)).await
+                    {
+                        if parent_error.proof == Proof::Insecure {
+                            return Err(ProofError::new(
+                                Proof::Insecure,
+                                ProofErrorKind::DsResponseInsecure { name: zone },
+                            ));
+                        }
+                    }
+                }
+                Err(error)
+            }
+            result => result.map(|_| ()),
+        }
     }
 
     /// Retrieves DS records for the given zone.
