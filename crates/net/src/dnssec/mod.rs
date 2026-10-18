@@ -280,6 +280,10 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             return Ok(message);
         }
 
+        // A negative answer after a CNAME chain denies the last name in the chain (RFC 6604), so
+        // the denial proof and the insecure-delegation check apply to that name.
+        let denied = cname_terminal(&query, &message.answers);
+
         let nsec3s = message
             .authorities
             .iter()
@@ -315,7 +319,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         // 10.5.2
         let nsec_proof = match (!nsec3s.is_empty(), !nsecs.is_empty(), must_validate_nsec) {
             (true, false, _) => verify_nsec3(
-                &query,
+                &denied,
                 find_soa_name(&message),
                 message.response_code,
                 &message.answers,
@@ -324,7 +328,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 self.nsec3_hard_iteration_limit,
             ),
             (false, true, _) => verify_nsec(
-                &query,
+                &denied,
                 find_soa_name(&message),
                 message.response_code,
                 &message.answers,
@@ -344,9 +348,9 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 // Return Ok if this is a valid positive response with no NSEC/NSEC3 records and no
                 // wildcard RRSIGs.
                 if message.answers.iter().any(|record| {
-                    record.name == query.name
+                    record.name == denied.name
                         && (record.record_type() == RecordType::CNAME
-                            || record.record_type() == query.query_type)
+                            || record.record_type() == denied.query_type)
                 }) {
                     return Ok(message);
                 }
@@ -359,9 +363,9 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 // * For other query types, if the queried name is provably Insecure
                 if let Err(err) = self
                     .find_ds_records(
-                        match query.query_type() {
-                            RecordType::DS => query.name().base_name(),
-                            _ => query.name().clone(),
+                        match denied.query_type() {
+                            RecordType::DS => denied.name().base_name(),
+                            _ => denied.name().clone(),
                         },
                         options,
                     )
@@ -1304,6 +1308,32 @@ fn verify_rrsig_with_keys(
 /// Note that a SOA record may not be present in all responses that must be NSEC/NSEC3 validated.
 /// See RFC 4035 B.4 - Referral to Signed Zone, B.5 Referral to Unsigned Zone, B.6 - Wildcard
 /// Expansion, RFC 5155 B.3 - Referral to an Opt-Out Unsigned Zone, and B.4 - Wildcard Expansion.
+/// `query` with its name replaced by the last name of the CNAME chain in `answers` that starts at
+/// the query name. CNAME, ANY and DS queries do not follow CNAMEs.
+fn cname_terminal(query: &Query, answers: &[Record]) -> Query {
+    let mut terminal = query.clone();
+    if matches!(
+        query.query_type(),
+        RecordType::CNAME | RecordType::ANY | RecordType::DS
+    ) {
+        return terminal;
+    }
+
+    let mut name = query.name();
+    // At most one step per answer record bounds the walk even if the chain loops.
+    for _ in 0..answers.len() {
+        let Some(target) = answers.iter().find_map(|record| match &record.data {
+            RData::CNAME(cname) if &record.name == name => Some(&cname.0),
+            _ => None,
+        }) else {
+            break;
+        };
+        name = target;
+    }
+    terminal.set_name(name.clone());
+    terminal
+}
+
 fn find_soa_name(verified_message: &DnsResponse) -> Option<&Name> {
     for record in &verified_message.authorities {
         if record.record_type() == RecordType::SOA && record.proof == Proof::Secure {
@@ -2080,7 +2110,9 @@ mod test {
         time::{Duration, Instant},
     };
 
-    use super::{RrsigValidity, find_nsec_covering_record, no_closer_matches, verify_nsec};
+    use super::{
+        RrsigValidity, cname_terminal, find_nsec_covering_record, no_closer_matches, verify_nsec,
+    };
     use crate::{
         dnssec::{
             DnsRequestOptions, Proof, ProofError, ProofErrorKind, RrsetVerificationContext,
@@ -2104,6 +2136,37 @@ mod test {
         },
     };
     use test_support::subscribe;
+
+    #[test]
+    fn cname_terminal_follows_chain_to_denied_name() {
+        let name = |n: &str| Name::from_ascii(n).unwrap();
+        let cname = |from: &str, to: &str| {
+            Record::from_rdata(name(from), 300, RData::CNAME(rdata::CNAME(name(to))))
+        };
+        let chain = [
+            cname("www.example.com.", "edge.example.net."),
+            cname("edge.example.net.", "host.cdn.example."),
+        ];
+
+        let query = Query::query(name("www.example.com."), AAAA);
+        assert_eq!(
+            cname_terminal(&query, &chain),
+            Query::query(name("host.cdn.example."), AAAA)
+        );
+        assert_eq!(cname_terminal(&query, &[]), query);
+
+        // DS answers describe the delegation and never follow CNAMEs.
+        let ds = Query::query(name("www.example.com."), DS);
+        assert_eq!(cname_terminal(&ds, &chain), ds);
+
+        // A looping chain ends after a bounded walk.
+        let looped = [
+            cname("a.example.", "b.example."),
+            cname("b.example.", "a.example."),
+        ];
+        let query = Query::query(name("a.example."), A);
+        assert_eq!(cname_terminal(&query, &looped), query);
+    }
 
     #[test]
     fn test_no_closer_matches() -> Result<(), ProtoError> {
