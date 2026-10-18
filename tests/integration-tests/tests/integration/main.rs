@@ -3,6 +3,7 @@ mod chained_zone_handler_tests;
 mod client_future_tests;
 mod client_tests;
 mod dnssec_client_handle_tests;
+mod insecure_delegation_tests;
 mod invalid_nsec3_tests;
 mod invalid_nsec_tests;
 mod lookup_tests;
