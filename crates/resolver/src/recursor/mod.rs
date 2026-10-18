@@ -542,8 +542,9 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
         // Return NXDomain and NoData responses in error form
         // These need to bypass the cache lookup (and casting to a Lookup object in general)
         // to preserve SOA and DNSSEC records, and to keep those records in the authorities
-        // section of the response.
-        if response.response_code == ResponseCode::NXDomain {
+        // section of the response. A CNAME chain ending in a negative answer is returned as a
+        // message so the chain is kept.
+        if response.response_code == ResponseCode::NXDomain && response.answers.is_empty() {
             use crate::recursor::RecursorError;
 
             let Err(dns_error) = DnsError::from_response(response) else {

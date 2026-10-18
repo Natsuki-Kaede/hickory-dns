@@ -32,7 +32,7 @@ use crate::{
     net::{DnsError, DnsHandle, NetError, NoRecords},
     proto::{
         access_control::{AccessControlSet, AccessControlSetBuilder},
-        op::{DnsRequest, DnsRequestOptions, Edns, Message, Query},
+        op::{DnsRequest, DnsRequestOptions, Edns, Message, Query, ResponseCode},
         rr::{
             Name, RData,
             RData::CNAME,
@@ -345,6 +345,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         RecursorError::recursion_exceeded(self.recursion_limit, depth, query.name())?;
 
         let mut cname_chain = vec![];
+        let mut negative_tail = None;
 
         let mut effective_qname = &query.name;
         let mut name_history = vec![effective_qname];
@@ -394,6 +395,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 .await
             {
                 Ok(cname_r) => cname_r,
+                Err(RecursorError::Negative(target)) => {
+                    return Ok(with_negative_target(response, target));
+                }
                 Err(e) => {
                     return Err(e);
                 }
@@ -417,11 +421,25 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 None
             }));
 
+            // A negative answer at the end of the chain describes the last name (RFC 6604).
+            if !response
+                .answers
+                .iter()
+                .any(|r| r.record_type() == query_type)
+            {
+                negative_tail = Some((response.metadata.response_code, response.authorities));
+            }
+
             break;
         }
 
         if !cname_chain.is_empty() {
             response.answers.extend(cname_chain);
+        }
+        if let Some((response_code, authorities)) = negative_tail {
+            response.metadata.response_code = response_code;
+            response.authorities = authorities;
+            response.additionals.clear();
         }
 
         Ok(response)
@@ -1171,9 +1189,10 @@ mod for_dnssec {
                 Err(e) => return Err(NetError::from(e)),
             };
 
-            // `DnssecDnsHandle` will only look at the answer section of the message so
-            // we can put "stubs" in the other fields
+            // `DnssecDnsHandle` validates the sections and the response code (a CNAME chain may
+            // end in NXDOMAIN), so the other fields can be stubs.
             let mut msg = Message::query();
+            msg.metadata.response_code = response.response_code;
 
             msg.add_answers(response.answers.iter().cloned());
             msg.add_authorities(response.authorities.iter().cloned());
@@ -1182,6 +1201,30 @@ mod for_dnssec {
             DnsResponse::from_message(msg.into_response()).map_err(NetError::from)
         }
     }
+}
+
+/// Answer a query whose CNAME chain ends in a name with no records of the requested type.
+///
+/// Per RFC 6604 the response code and authority section describe the last name in the chain, so
+/// the chain collected in `response` is kept and the target's negative answer (NXDOMAIN or
+/// NODATA, with its SOA and denial records) replaces the authority section.
+fn with_negative_target(mut response: Message, target: AuthorityData) -> Message {
+    response.metadata.response_code = match target.is_nx_domain() {
+        true => ResponseCode::NXDomain,
+        false => ResponseCode::NoError,
+    };
+    response.authorities = target
+        .authorities
+        .map(|records| records.to_vec())
+        .unwrap_or_default();
+    if let Some(soa) = target.soa {
+        let soa = soa.into_record_of_rdata();
+        if !response.authorities.contains(&soa) {
+            response.authorities.push(soa);
+        }
+    }
+    response.additionals.clear();
+    response
 }
 
 fn recursor_opts(

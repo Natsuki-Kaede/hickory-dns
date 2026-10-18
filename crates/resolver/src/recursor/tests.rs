@@ -1204,7 +1204,7 @@ mod ecs {
     use crate::recursor::{DnssecConfig, DnssecPolicy};
     use crate::{
         proto::{
-            op::{Edns, OpCode},
+            op::{Edns, OpCode, ResponseCode},
             rr::{
                 RData,
                 rdata::{
@@ -1241,19 +1241,43 @@ mod ecs {
                 .unwrap()
                 .push((destination, query.clone(), sent));
 
-            let alias = name("alias.hickory-dns.testing.");
-            let mut response = if destination == LEAF_IP
-                && query.name() == &alias
-                && query.query_type() == RecordType::A
-            {
+            let target = [
+                ("alias.hickory-dns.testing.", "host.hickory-dns.testing."),
+                (
+                    "alias-nodata.hickory-dns.testing.",
+                    "nodata.hickory-dns.testing.",
+                ),
+                (
+                    "alias-nx.hickory-dns.testing.",
+                    "missing.hickory-dns.testing.",
+                ),
+                (
+                    "alias-2hop.hickory-dns.testing.",
+                    "alias-nodata.hickory-dns.testing.",
+                ),
+            ]
+            .into_iter()
+            .find(|(alias, _)| query.name() == &name(alias))
+            .map(|(_, target)| name(target));
+            let leaf_a = destination == LEAF_IP && query.query_type() == RecordType::A;
+            let mut response = if let Some(target) = target.filter(|_| leaf_a) {
                 let mut response = Message::response(request.id, OpCode::Query);
                 response.add_query(query.clone());
                 response.metadata.authoritative = true;
                 response.add_answer(Record::from_rdata(
-                    alias,
+                    query.name().clone(),
                     300,
-                    RData::CNAME(CNAME(name("host.hickory-dns.testing."))),
+                    RData::CNAME(CNAME(target)),
                 ));
+                response
+            } else if leaf_a && query.name() == &name("missing.hickory-dns.testing.") {
+                let mut response = self.inner.handle(
+                    destination,
+                    protocol,
+                    nodata_request(&request, "nodata.hickory-dns.testing."),
+                );
+                response.queries = vec![query.clone()];
+                response.metadata.response_code = ResponseCode::NXDomain;
                 response
             } else {
                 self.inner.handle(destination, protocol, request)
@@ -1523,6 +1547,79 @@ mod ecs {
         let resolution = fixture.resolve(nodata, subnet("203.0.113.0/24")).await;
         assert!(resolution.result.is_err());
         assert_eq!(fixture.sent(LEAF_IP, nodata).len(), 2);
+    }
+
+    /// `request` asking `qname` instead, to reuse the mock's negative answer for it.
+    fn nodata_request(request: &Message, qname: &str) -> Message {
+        let mut request = request.clone();
+        request.queries[0].set_name(name(qname));
+        request
+    }
+
+    /// The CNAME chain and the target's SOA of a negative answer after a CNAME.
+    fn assert_negative_chain(response: &Message, alias: &str, target: &str) {
+        let cname = response
+            .answers
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::CNAME(cname) if record.name == name(alias) => Some(&cname.0),
+                _ => None,
+            });
+        assert_eq!(cname, Some(&name(target)));
+        assert!(
+            response
+                .authorities
+                .iter()
+                .any(|record| record.record_type() == RecordType::SOA),
+            "missing SOA: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cname_to_nodata_keeps_chain() {
+        let alias = "alias-nodata.hickory-dns.testing.";
+        let fixture = Fixture::new(&[]);
+
+        let response = fixture
+            .resolve(alias, ResolveOptions::default())
+            .await
+            .result
+            .unwrap();
+        assert_eq!(response.response_code, ResponseCode::NoError);
+        assert_negative_chain(&response, alias, "nodata.hickory-dns.testing.");
+    }
+
+    #[tokio::test]
+    async fn cname_chain_to_nodata_keeps_last_negative_answer() {
+        let alias = "alias-2hop.hickory-dns.testing.";
+        let fixture = Fixture::new(&[]);
+
+        let response = fixture
+            .resolve(alias, ResolveOptions::default())
+            .await
+            .result
+            .unwrap();
+        assert_eq!(response.response_code, ResponseCode::NoError);
+        assert_negative_chain(&response, alias, "alias-nodata.hickory-dns.testing.");
+        assert_negative_chain(
+            &response,
+            "alias-nodata.hickory-dns.testing.",
+            "nodata.hickory-dns.testing.",
+        );
+    }
+
+    #[tokio::test]
+    async fn cname_to_nxdomain_keeps_chain() {
+        let alias = "alias-nx.hickory-dns.testing.";
+        let fixture = Fixture::new(&[]);
+
+        let response = fixture
+            .resolve(alias, ResolveOptions::default())
+            .await
+            .result
+            .unwrap();
+        assert_eq!(response.response_code, ResponseCode::NXDomain);
+        assert_negative_chain(&response, alias, "missing.hickory-dns.testing.");
     }
 
     #[tokio::test]
