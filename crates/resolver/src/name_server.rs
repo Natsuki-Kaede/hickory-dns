@@ -64,6 +64,14 @@ pub struct NameServer<P: ConnectionProvider> {
 }
 
 impl<P: ConnectionProvider> NameServer<P> {
+    pub(crate) fn admit(
+        &self,
+    ) -> impl std::future::Future<Output = Result<crate::connection_provider::Admission, NetError>>
+    + Send
+    + 'static {
+        self.connection_provider.admit()
+    }
+
     /// Create a new [`NameServer`] with the given connections and configuration.
     ///
     /// The `connections` will usually be empty.

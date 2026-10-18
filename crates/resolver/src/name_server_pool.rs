@@ -373,6 +373,19 @@ impl<P: ConnectionProvider> PoolState<P> {
                     let future = async move { attempt.send(request, policy, &cx).await };
                     let attempt_timeout = self.cx.options.server_attempt_timeout;
                     async move {
+                        // Admission waits within the pool deadline, before the attempt timeout
+                        // starts, and its failure does not penalize the server.
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let _admission = match <<P as ConnectionProvider>::RuntimeProvider as RuntimeProvider>::Timer::timeout(
+                            remaining,
+                            server.admit(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(admission)) => admission,
+                            Ok(Err(error)) => return (server, Err(error)),
+                            Err(_) => return (server, Err(NetError::Timeout)),
+                        };
                         let Some(attempt_timeout) = attempt_timeout else {
                             return (server, future.await);
                         };
@@ -1477,6 +1490,85 @@ mod tests {
             ns_unreachable.decayed_srtt() > initial_srtt,
             "a server whose attempt timed out should be deprioritized"
         );
+    }
+
+    /// Waiting for admission does not count against a server's attempt timeout: a provider
+    /// that admits after longer than the attempt timeout still gets its answer.
+    #[tokio::test]
+    async fn test_admission_wait_is_outside_attempt_timeout() {
+        subscribe();
+
+        let ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("example.com.").unwrap();
+        let handler = MockNetworkHandler::new(vec![MockRecord::a(ip, &query_name, ip)]);
+        let provider = SlowAdmission {
+            inner: MockProvider::new(handler),
+            delay: Duration::from_millis(300),
+        };
+
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 1,
+            timeout: Duration::from_secs(5),
+            server_attempt_timeout: Some(Duration::from_millis(100)),
+            ..ResolverOpts::default()
+        };
+        let server = Arc::new(NameServer::new(
+            [].into_iter(),
+            NameServerConfig::udp(ip),
+            &opts,
+            provider,
+        ));
+        let pool = NameServerPool::from_nameservers(
+            vec![server],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        let response = pool
+            .lookup(
+                Query::query(query_name, RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer()
+            .await
+            .expect("admission wait must not time out the attempt");
+        assert!(!response.answers.is_empty());
+    }
+
+    /// A [`ConnectionProvider`] that admits each attempt only after `delay`.
+    #[derive(Clone)]
+    struct SlowAdmission {
+        inner: MockProvider,
+        delay: Duration,
+    }
+
+    impl ConnectionProvider for SlowAdmission {
+        type Conn = <MockProvider as ConnectionProvider>::Conn;
+        type FutureConn = <MockProvider as ConnectionProvider>::FutureConn;
+        type RuntimeProvider = MockProvider;
+
+        fn new_connection(
+            &self,
+            ip: IpAddr,
+            config: &crate::config::ConnectionConfig,
+            cx: &PoolContext,
+        ) -> Result<Self::FutureConn, NetError> {
+            self.inner.new_connection(ip, config, cx)
+        }
+
+        fn runtime_provider(&self) -> &MockProvider {
+            &self.inner
+        }
+
+        fn admit(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::Admission, NetError>> + Send + 'static>>
+        {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(crate::Admission::default())
+            })
+        }
     }
 
     /// A [`RuntimeProvider`] wrapper where specified IPs never complete their

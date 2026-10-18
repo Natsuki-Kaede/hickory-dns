@@ -182,7 +182,7 @@ pub use hickory_proto as proto;
 pub mod caching_client;
 pub mod config;
 mod connection_provider;
-pub use connection_provider::{ConnectionProvider, TlsConfig};
+pub use connection_provider::{Admission, ConnectionProvider, TlsConfig};
 mod hosts;
 pub use hosts::Hosts;
 pub mod lookup;

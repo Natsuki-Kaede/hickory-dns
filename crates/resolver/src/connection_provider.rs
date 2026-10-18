@@ -65,6 +65,32 @@ pub trait ConnectionProvider: 'static + Clone + Send + Sync + Unpin {
 
     /// Get a reference to a [`RuntimeProvider`].
     fn runtime_provider(&self) -> &Self::RuntimeProvider;
+
+    /// Admit one attempt to send a request to a name server.
+    ///
+    /// The pool awaits this before an attempt's own timeout starts, bounded only by the pool
+    /// deadline, and holds the returned guard until the attempt ends. A provider can use it to
+    /// apply outbound limits (for example a global rate or concurrency bound) without that wait
+    /// counting against, or penalizing, the name server. An error fails the attempt without
+    /// penalizing the server. The default admits immediately.
+    fn admit(&self) -> Pin<Box<dyn Future<Output = Result<Admission, NetError>> + Send + 'static>> {
+        Box::pin(std::future::ready(Ok(Admission::default())))
+    }
+}
+
+/// A guard returned by [`ConnectionProvider::admit`], held for the duration of one attempt.
+#[derive(Default)]
+pub struct Admission {
+    _guard: Option<Box<dyn Send + Sync>>,
+}
+
+impl Admission {
+    /// Hold `guard` until the attempt ends.
+    pub fn new(guard: impl Send + Sync + 'static) -> Self {
+        Self {
+            _guard: Some(Box::new(guard)),
+        }
+    }
 }
 
 impl<P: RuntimeProvider> ConnectionProvider for P {
